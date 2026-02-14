@@ -18,8 +18,8 @@ INTERNAL_KEYS = {
 UCI_MAPPING = {
     "dataset_name": "uci",
     "columns": {
-        "PPG": "ppg", "II": "ecg", "time": "timestamp",
-        "sys": "bps", "dia": "bpd", "subject_id": "patient_id"
+        "ppg": "ppg", "ecg": "ecg", "timestamp": "timestamp",
+        "bps": "bps", "bpd": "bpd", "patient_id": "patient_id"
     },
     "channels": {
         "ppg": {"fs": 125},

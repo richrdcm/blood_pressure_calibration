@@ -120,3 +120,48 @@ class MorphologyExtractor:
 
         rel_idx = np.argmax(search_area)
         return rel_idx + search_start
+
+
+class PhysiologicalWaveFinder:
+    def __init__(self, alpha, intercept, fs=125):
+        self.alpha = alpha
+        self.intercept = intercept
+        self.fs = fs
+
+    def get_physical_belief(self, bps, r_peak_idx):
+        """
+        Predicts where the systolic peak SHOULD be based on physics.
+        ln(PTT) = (-alpha/2) * BPS + Intercept
+        """
+        beta_1 = -self.alpha / 2
+        pred_log_ptt = (beta_1 * bps) + self.intercept
+        pred_ptt_ms = np.exp(pred_log_ptt)
+
+        # Convert ms delay to sample index
+        delay_samples = int((pred_ptt_ms / 1000) * self.fs)
+        return r_peak_idx + delay_samples
+
+    def find_waves_with_belief(self, ppg_signal, r_peaks, bps):
+        """
+        Search for peaks ONLY within the physical belief window.
+        """
+        predictions = []
+        # Search window +/- 40ms around the physical prediction
+        window_size = int(0.04 * self.fs)
+
+        for r_idx in r_peaks:
+            t_pred_idx = self.get_physical_belief(bps, r_idx)
+
+            # Slice the search area
+            start, end = t_pred_idx - window_size, t_pred_idx + window_size
+            search_slice = ppg_signal[max(0, start): min(len(ppg_signal), end)]
+
+            if len(search_slice) > 0:
+                actual_idx = np.argmax(search_slice) + start
+                predictions.append({
+                    'r_peak': r_idx,
+                    'predicted_idx': t_pred_idx,
+                    'actual_idx': actual_idx,
+                    'error_ms': (actual_idx - t_pred_idx) * (1000 / self.fs)
+                })
+        return predictions
