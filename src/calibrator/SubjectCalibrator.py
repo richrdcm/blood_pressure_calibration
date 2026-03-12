@@ -134,33 +134,23 @@ class SubjectCalibrator:
 
 class FeatureExporter:
     @staticmethod
-    def extract_training_data(samples, fs):
+    def extract_training_data(samples, ppg_waves, time_features):
         rows = []
-        for sample in samples:
+        for sample, ppg_wave, time_feature in zip(samples, ppg_waves, time_features):
             from src.extractor.morphology import MorphologyExtractor
-            from src.extractor.times import TimeExtractor
 
             # 1. Signal Processing
-            ppg_proc = Preprocessor.clean_signal(sample.ppg, fs)
-            # Note: Ensure extract_waves returns 3 values.
-            # If your MorphologyExtractor only returns 'waves', adjust this line.
-            vpg, apg, waves = MorphologyExtractor.extract_waves(ppg_proc, fs)
-
-            ecg_cleaned = nk.ecg_clean(sample.ecg, sampling_rate=fs)
-            _, r_info = nk.ecg_peaks(ecg_cleaned, sampling_rate=fs)
-            r_peaks = r_info["ECG_R_Peaks"]
-
-            # 2. Get Transit Times
-            time_features = TimeExtractor.compute_heartbeat_times(r_peaks, waves, fs, ppg_proc)
+            t, ppg_proc = Preprocessor.clean_ppg_signal(sample)
+            vpg, apg, waves = ppg_wave
 
             # 3. Feature Mapping
-            for f in time_features:
+            for f in time_feature:
                 # Find the wave dictionary that corresponds to this time feature
                 w = next((x for x in waves if x['a'] == f['a_idx']), None)
                 if not w: continue
 
                 # A. Crest Time
-                crest_time = (w['ppg_peak'] - w['a']) * (1000 / fs)
+                crest_time = (w['ppg_peak'] - w['a']) * (1 / sample.target_fs)
 
                 # B. Total AUC (Pulse Volume Proxy)
                 # Dynamic windowing: From 'a' (start) to 'a' of next wave (if avail) or +800ms
@@ -168,7 +158,7 @@ class FeatureExporter:
                 if current_idx + 1 < len(waves):
                     pulse_end = waves[current_idx + 1]['a']
                 else:
-                    pulse_end = w['a'] + int(fs * 0.8)
+                    pulse_end = w['a'] + int(sample.target_fs * 0.8)
 
                 pulse_segment = ppg_proc[w['a']: min(pulse_end, len(ppg_proc))]
                 # Zero-baseline to ensure area represents pulsatile volume only

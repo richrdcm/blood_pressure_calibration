@@ -1,6 +1,8 @@
 import plotly.graph_objects as go
 import numpy as np
 from plotly.subplots import make_subplots
+from pyparsing import originalTextFor
+
 from schemas.bp_schema import BPSample
 import neurokit2 as nk
 from scipy.stats import norm
@@ -13,24 +15,13 @@ from utils.preprocessing import Preprocessor
 
 class Visualizator:
     @staticmethod
-    def plot_signals(sample: BPSample):
-        fs = sample.fs
-
-        # --- SAFETY CHECK: Force identical lengths ---
-        # We use the length of the timestamp as the "Master" length
-        master_len = len(sample.timestamp)
-
+    def plot_signals(sample: BPSample, clean_sample: BPSample):
         # Prepare PPG (ensure length matches timestamp)
-        ppg_raw = sample.ppg[:master_len]
-        ppg_proc = Preprocessor.clean_signal(ppg_raw, fs)
+        ppg_raw = sample.ppg
+        ppg_proc = clean_sample.ppg
 
-        # Prepare ECG (ensure length matches timestamp)
-        ecg_raw = None
-        ecg_proc = None
-        if sample.ecg:
-            # Trim or pad ECG to match timestamp length
-            ecg_raw = sample.ecg[:master_len]
-            ecg_proc = Preprocessor.process_ecg(ecg_raw, fs)
+        ecg_raw = sample.ecg
+        ecg_proc = clean_sample.ecg
 
         # Create Figure
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
@@ -39,15 +30,15 @@ class Visualizator:
 
         # --- PPG TRACES (Row 1) ---
         # Use master_len to ensure x and y match
-        fig.add_trace(go.Scatter(x=sample.timestamp[:master_len], y=ppg_raw, name="Raw PPG"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=sample.timestamp[:master_len], y=ppg_proc, name="Processed PPG", visible=False),
+        fig.add_trace(go.Scatter(x=sample.ppg_timestamps, y=ppg_raw, name="Raw PPG"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=clean_sample.ppg_timestamps, y=ppg_proc, name="Processed PPG", visible=False),
                       row=1, col=1)
 
         # --- ECG TRACES (Row 2) ---
         if ecg_raw is not None:
-            fig.add_trace(go.Scatter(x=sample.timestamp[:master_len], y=ecg_raw, name="Raw ECG",
+            fig.add_trace(go.Scatter(x=sample.ecg_timestamps, y=ecg_raw, name="Raw ECG",
                                      line=dict(color='#FF0000', width=1)), row=2, col=1)
-            fig.add_trace(go.Scatter(x=sample.timestamp[:master_len], y=ecg_proc, name="Processed ECG",
+            fig.add_trace(go.Scatter(x=clean_sample.ecg_timestamps, y=ecg_proc, name="Processed ECG",
                                      line=dict(color='#8B0000', width=1.5), visible=False), row=2, col=1)
 
         # --- DROP-DOWN SELECTOR (Raw vs Processed) ---
@@ -80,12 +71,12 @@ class Visualizator:
                     dict(label="Show Raw",
                          method="update",
                          args=[{"visible": [True, False, True, False]},
-                               {"title.text": f"Raw Signal Analysis - Patient {sample.patient_id}"}]),
+                               {"title.text": f"Raw Signals - Patient {sample.patient_id}"}]),
                     # Updates the global title text
                     dict(label="Show Processed",
                          method="update",
                          args=[{"visible": [False, True, False, True]},
-                               {"title.text": f"Filtered/Normalized Analysis - Patient {sample.patient_id}"}]),
+                               {"title.text": f"Preprocessed Signals - Patient {sample.patient_id}"}]),
                 ],
                 direction="down",
                 showactive=True,
@@ -120,20 +111,16 @@ class Visualizator:
         fig.show()
 
     @staticmethod
-    def plot_morphology_from_ecg(sample: BPSample):
-        fs = sample.fs
-        master_len = len(sample.timestamp)
-        time = np.array(sample.timestamp[:master_len])
-
-        # 1. Processing (Signals & Peaks)
-        ppg_proc = Preprocessor.clean_signal(sample.ppg[:master_len], fs)
-        ecg_cleaned = nk.ecg_clean(sample.ecg[:master_len], sampling_rate=fs, method="neurokit")
-        _, r_peak_info = nk.ecg_peaks(ecg_cleaned, sampling_rate=fs, method="neurokit")
-        r_peaks = r_peak_info["ECG_R_Peaks"]
+    def plot_morphology_from_ecg(cleaned_sample: BPSample, ppg_wave: list, time_feature: list):
+        ppg_proc = np.asarray(cleaned_sample.ppg)
+        ecg_proc = np.asarray(cleaned_sample.ecg)
+        target_fs = cleaned_sample.target_fs
+        ecg_time = np.asarray(cleaned_sample.ecg_timestamps)
+        ppg_time = np.asarray(cleaned_sample.ppg_timestamps)
 
         # 2. Feature Extraction
-        vpg, apg, waves = MorphologyExtractor.extract_waves(ppg_proc, fs)
-        time_features = TimeExtractor.compute_heartbeat_times(r_peaks, waves, fs, ppg_proc)
+        vpg, apg, waves = ppg_wave
+        r_peaks = TimeExtractor.extract_ecg_r_peaks(ecg_signal=ecg_proc, fs=target_fs)
 
         # 3. Create Subplots
         fig = make_subplots(
@@ -142,27 +129,30 @@ class Visualizator:
         )
 
         # --- ECG Plot ---
-        fig.add_trace(go.Scatter(x=time, y=ecg_cleaned, name="ECG", line=dict(color='#FF3E3E', width=1)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=ecg_time,
+                                 y=cleaned_sample.ecg,
+                                 name="ECG", line=dict(color='#FF3E3E', width=1)), row=2, col=1)
         fig.add_trace(go.Scatter(
-            x=time[r_peaks], y=ecg_cleaned[r_peaks], mode='markers', name='R-Peaks',
+            x=ecg_time[r_peaks],
+            y=ecg_proc[r_peaks], mode='markers', name='R-Peaks',
             marker=dict(color='white', size=8, symbol='circle-open'),
             hovertemplate="<b>ECG R-Peak</b><br>Reference Time: %{x}ms<extra></extra>"
         ), row=2, col=1)
 
         # --- PPG Signal Trace ---
         fig.add_trace(go.Scatter(
-            x=time, y=ppg_proc, name="PPG", line=dict(color='#00FF00', width=1.5),
+            x=ecg_time, y=ppg_proc, name="PPG", line=dict(color='#00FF00', width=1.5),
             hoverinfo='skip'
         ), row=1, col=1)
 
         # 4. Add Annotated Markers
-        for f in time_features:
-            t_r = time[f['r_peak']]
-            t_a = time[f['a_idx']]
+        for f in time_feature:
+            t_r = ppg_time[f['r_peak']]
+            t_a = ppg_time[f['a_idx']]
             print(f"DEBUG: R-time: {t_r} | a-time: {t_a} | Diff: {t_a - t_r}")
 
-        for f in time_features:
-            t_r = time[f['r_peak']]
+        for f in time_feature:
+            t_r = ppg_time[f['r_peak']]
 
             # Vertical Anchor Projection (Electrical Start)
             fig.add_vline(x=t_r, line_dash="dot", line_color="rgba(255, 255, 255, 0.2)", row="all")
@@ -179,7 +169,7 @@ class Visualizator:
                 ptt_val = f['ptt_a'] if key == 'a' else (f['ptt_e'] if key == 'e' else None)
 
                 fig.add_trace(go.Scatter(
-                    x=[time[idx]], y=[ppg_proc[idx]],
+                    x=[ppg_time[idx]], y=[ppg_proc[idx]],
                     mode='markers+text',
                     text=[key], textposition="top center",
                     marker=dict(size=7, color='yellow' if key != 'e' else 'magenta'),
@@ -190,7 +180,7 @@ class Visualizator:
 
             # B. Systolic Peak (White Star)
             fig.add_trace(go.Scatter(
-                x=[time[w['ppg_peak']]], y=[ppg_proc[w['ppg_peak']]],
+                x=[ppg_time[w['ppg_peak']]], y=[ppg_proc[w['ppg_peak']]],
                 mode='markers',
                 marker=dict(symbol='star', size=12, color='white', line=dict(width=1, color='black')),
                 name='Systolic Peak',
@@ -200,10 +190,10 @@ class Visualizator:
 
             # C. Diastolic Peak (Cyan Star)
             if f['ptt_dia']:
-                dp_idx = int(f['r_peak'] + (f['ptt_dia'] * fs / 1000))
-                if dp_idx < len(time):
+                dp_idx = int(f['r_peak'] + (f['ptt_dia'] * target_fs / 1000))
+                if dp_idx < len(ppg_time):
                     fig.add_trace(go.Scatter(
-                        x=[time[dp_idx]], y=[ppg_proc[dp_idx]],
+                        x=[ppg_time[dp_idx]], y=[ppg_proc[dp_idx]],
                         mode='markers',
                         marker=dict(symbol='star', size=12, color='cyan', line=dict(width=1, color='black')),
                         name='Diastolic Peak',
@@ -213,7 +203,7 @@ class Visualizator:
 
         # 5. Layout Update
         fig.update_layout(
-            title=dict(text=f"Hemodynamic Mapping: Patient {sample.patient_id}", x=0.5, font=dict(size=22)),
+            title=dict(text=f"Hemodynamic Mapping: Patient {cleaned_sample.patient_id}", x=0.5, font=dict(size=22)),
             template="plotly_dark",
             height=800,
             hovermode="closest",
@@ -223,12 +213,11 @@ class Visualizator:
         fig.show()
 
     @staticmethod
-    def plot_morphology_from_apg(sample: BPSample):
-        fs = sample.fs
-        time = np.array(sample.timestamp)
-        ppg_proc = Preprocessor.clean_signal(sample.ppg, fs)
-        vpg, apg, waves = MorphologyExtractor.extract_waves(ppg_proc, fs)
-
+    def plot_morphology_from_apg(clean_sample: BPSample, ppg_wave: list):
+        fs = clean_sample.target_fs
+        time = np.array(clean_sample.ecg_timestamps)
+        ppg_proc = clean_sample.ppg
+        vpg, apg, waves = ppg_wave
 
         fig = make_subplots(
             rows=3, cols=1, shared_xaxes=True,
@@ -255,7 +244,7 @@ class Visualizator:
                        name='Diastolic Peak'),
             row=1, col=1)
 
-        for w in waves:
+        for i, w in enumerate(waves):
             # Calculate AGI for this specific beat
             agi = MorphologyExtractor.calculate_aging_index(apg, w)
 
@@ -351,7 +340,7 @@ class Visualizator:
 
         fig.update_layout(
             title={
-                'text': f"PPG Morphology Analysis - Patient {sample.patient_id}",
+                'text': f"PPG Morphology Analysis - Patient {clean_sample.patient_id}",
                 'x': 0.5, 'xanchor': 'center', 'font': dict(size=20)
             },
             height=1000, template="plotly_dark", showlegend=True,
@@ -359,15 +348,17 @@ class Visualizator:
         fig.show()
 
     @staticmethod
-    def plot_estimation_performance(sample):
+    def plot_estimation_performance(sample, ppg_wave, time_feature):
         """
         Visualizes the pre-calculated Bayesian Estimation.
         No math performed here.
         """
-        fs = sample.fs
+        fs = sample.target_fs
 
         # 1. Extract Features & Get Calibration Results
-        df_feat = FeatureExporter.extract_training_data([sample], fs)
+        df_feat = FeatureExporter.extract_training_data(samples=[sample],
+                                                        ppg_waves=[ppg_wave],
+                                                        time_features=[time_feature])
         calib = SubjectCalibrator().calibrate_patient(df_feat, sample.patient_id)
 
         if not calib:
@@ -570,4 +561,111 @@ class Visualizator:
             title="Biophysical Parameter Distribution (Population)",
             template="plotly_dark", height=400
         )
+        fig.show()
+
+    @staticmethod
+    def plot_fiducial_comparison(sample, clean_sample, ppg_wave, colleague_csv_path, colleague_fs=25.0):
+        """
+        Visually compares fiducial points from a colleague (CSV) with your own.
+        Automatically handles Sampling Rate mismatches and time-array regeneration.
+        """
+        import os
+        import pandas as pd
+        from utils.preprocessing import Preprocessor
+
+        fs = clean_sample.target_fs
+
+        # Define our arrays clearly
+        raw_timestamps = np.array(sample.ppg_timestamps)
+        clean_timestamps = np.array(clean_sample.ppg_timestamps)
+        ppg_proc = np.array(clean_sample.ppg)
+        ppg_time_2, ppg_proc_2 = Preprocessor.clean_ppg_signal_cheby(sample)
+
+        vpg, apg, waves = ppg_wave
+
+        # 4. Load Colleague's Points
+        if not os.path.exists(colleague_csv_path):
+            print(f"Error: Colleague CSV not found at {colleague_csv_path}")
+            return
+
+        df_coll = pd.read_csv(colleague_csv_path)
+
+        # 5. Create Subplots
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+            subplot_titles=(f"Your Fiducial Points ({fs} Hz)",
+                            f"Colleague's Fiducial Points (No resampling)")
+        )
+
+        # Plot your cleaned signal on BOTH rows so we can compare apples to apples
+        fig.add_trace(
+            go.Scatter(x=clean_timestamps, y=ppg_proc, name="Processed PPG", line=dict(color='#00FF00', width=1.5)),
+            row=1, col=1)
+        fig.add_trace(
+            go.Scatter(x=ppg_time_2, y=ppg_proc_2, name="Processed PPG", line=dict(color='#00FF00', width=1.5),
+                       showlegend=False), row=2, col=1)
+
+        # --- ROW 1: YOUR POINTS ---
+        for w in waves:
+            for key in ['a', 'b', 'c', 'd', 'e']:
+                idx = w.get(key)
+                if idx is not None and idx < len(ppg_proc):
+                    fig.add_trace(go.Scatter(
+                        x=[clean_timestamps[idx]], y=[ppg_proc[idx]], mode='markers+text',
+                        text=[f"<b>{key}</b>"], textposition="top center",
+                        marker=dict(size=8, color='yellow' if key != 'e' else 'magenta'),
+                        name=f"User {key}", showlegend=False
+                    ), row=1, col=1)
+
+            sys_peak = w.get('ppg_peak')
+            if sys_peak is not None and sys_peak < len(ppg_proc):
+                fig.add_trace(go.Scatter(
+                    x=[clean_timestamps[sys_peak]], y=[ppg_proc[sys_peak]], mode='markers+text',
+                    text=["<b>sys_peak</b>"], textposition="top center",
+                    marker=dict(symbol='star', size=12, color='white', line=dict(width=1, color='black')),
+                    showlegend=False
+                ), row=1, col=1)
+
+        # --- ROW 2: COLLEAGUE'S POINTS ---
+        colleague_cols = ['sp', 'dn', 'dp', 'a', 'b', 'c', 'd', 'e', 'f']
+
+        # We will use a color map to differentiate his major points
+        color_map = {
+            'on': 'yellow', 'sp': 'white', 'dn': 'magenta', 'dp': 'cyan', 'off': 'red'
+        }
+
+        for _, row in df_coll.iterrows():
+            for col in colleague_cols:
+                if col in row and pd.notna(row[col]):
+                    raw_idx = int(row[col])
+
+                    # 1. Ensure index is within the bounds of the RAW sample
+                    if 0 <= raw_idx < len(raw_timestamps):
+                        # 2. Get the actual real-world time of their point
+                        true_time = raw_timestamps[raw_idx]
+
+                        # 3. MAP IT: Find the exact closest index in our new resampled grid
+                        clean_idx = (np.abs(clean_timestamps - true_time)).argmin()
+
+                        marker_color = color_map.get(col, 'orange')
+                        marker_symbol = 'star' if col in ['sp', 'dp'] else 'circle'
+                        marker_size = 10 if col in ['sp', 'dp', 'on', 'dn'] else 7
+
+                        # Plot using the newly mapped clean_idx
+                        fig.add_trace(go.Scatter(
+                            #x=[clean_timestamps[clean_idx]], y=[ppg_proc[clean_idx]], mode='markers+text',
+                            x=[ppg_time_2[raw_idx]], y=[ppg_proc_2[raw_idx]], mode='markers+text',
+                            text=[f"<b>{col}</b>"], textposition="bottom center",
+                            marker=dict(symbol=marker_symbol, size=marker_size, color=marker_color,
+                                        line=dict(width=1, color='black')),
+                            name=f"Colleague {col}", showlegend=False
+                        ), row=2, col=1)
+
+        # --- LAYOUT FINISHING ---
+        fig.update_layout(
+            title=dict(text=f"Fiducial Point Alignment Analysis - Patient {sample.patient_id}", x=0.5),
+            template="plotly_dark", height=800, hovermode="x unified",
+            xaxis2=dict(title="Time (ms)", rangeslider=dict(visible=True, thickness=0.05))
+        )
+
         fig.show()

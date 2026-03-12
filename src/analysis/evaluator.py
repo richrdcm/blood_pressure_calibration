@@ -6,7 +6,7 @@ from src.calibrator.SubjectCalibrator import SubjectCalibrator, FeatureExporter
 
 class HemodynamicEvaluator:
     @staticmethod
-    def process_population(samples, fs=125):
+    def process_population(samples, ppg_waves, time_features, fs=125):
         """
         Iterates through ALL samples, calibrates each, and aggregates results.
         Returns:
@@ -18,32 +18,31 @@ class HemodynamicEvaluator:
 
         print(f"Starting Batch Processing for {len(samples)} patients...")
 
-        for i, sample in enumerate(samples):
-            try:
-                # 1. Feature Extraction
-                df_feat = FeatureExporter.extract_training_data([sample], fs)
+        for i, (sample, ppg_wave, time_feature) in enumerate(zip(samples, ppg_waves, time_features)):
 
-                # 2. Calibration & Estimation
-                # This returns the dictionary with 'sbp_est_mean', 'alpha_mean', etc.
-                calib = calibrator.calibrate_patient(df_feat, sample.patient_id)
+            # 1. Feature Extraction
+            df_feat = FeatureExporter.extract_training_data(samples=[sample],
+                                                            ppg_waves=[ppg_wave],
+                                                            time_features=[time_feature])
 
-                if calib is None:
-                    continue
+            # 2. Calibration & Estimation
+            # This returns the dictionary with 'sbp_est_mean', 'alpha_mean', etc.
+            calib = calibrator.calibrate_patient(df_feat, sample.patient_id)
 
-                # 3. Aggregate Data
-                # We combine the Calibration results with the Ground Truth labels
-                row = calib.copy()
-                row['ref_sbp'] = sample.bps
-                row['ref_dbp'] = sample.bpd
+            if calib is None:
+                continue
 
-                # Calculate Individual Errors
-                row['error_sbp'] = row['sbp_est_mean'] - sample.bps
-                row['error_dbp'] = row['dbp_est_mean'] - sample.bpd
+            # 3. Aggregate Data
+            # We combine the Calibration results with the Ground Truth labels
+            row = calib.copy()
+            row['ref_sbp'] = sample.bps
+            row['ref_dbp'] = sample.bpd
 
-                results.append(row)
+            # Calculate Individual Errors
+            row['error_sbp'] = row['sbp_est_mean'] - sample.bps
+            row['error_dbp'] = row['dbp_est_mean'] - sample.bpd
 
-            except Exception as e:
-                print(f"Error processing {sample.patient_id}: {e}")
+            results.append(row)
 
         # 4. Create DataFrame & Save CSV
         df_results = pd.DataFrame(results)

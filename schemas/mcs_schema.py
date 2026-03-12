@@ -10,5 +10,5 @@ def map_mcs_to_internal(df: pd.DataFrame, fs: int = 125) -> BPSample:
         ecg=df['ecg'].tolist() if 'ecg' in df.columns else None,
         bps=float(df['bps'].iloc[0]),
         bpd=float(df['bpd'].iloc[0]),
-        fs=fs
+        target_fs=fs
     )

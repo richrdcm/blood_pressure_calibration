@@ -1,10 +1,17 @@
 import numpy as np
 from scipy.signal import find_peaks
+from schemas.bp_schema import BPSample
 
 
 class MorphologyExtractor:
+    def extract_samples_waves(self, samples: list[BPSample]):
+        waves = []
+        for sample in samples:
+            waves.append(self.extract_sample_waves(sample.ppg, sample.target_fs))
+        return waves
+
     @staticmethod
-    def extract_waves(ppg_signal, fs):
+    def extract_sample_waves(ppg_signal, fs):
         """
         For a robust biophysical model, tune the distance based on the
         Physiological Range of the human heart.
@@ -104,7 +111,7 @@ class MorphologyExtractor:
                 wall_idx = len(ppg_signal)
         else:
             # Fallback: 450ms search window
-            wall_idx = min(e_idx + int(fs * 0.45), len(ppg_signal))
+            wall_idx = min(e_idx + int(fs * 450), len(ppg_signal))
 
         # Define the Search Slice
         search_start = e_idx + 2
@@ -138,7 +145,7 @@ class PhysiologicalWaveFinder:
         pred_ptt_ms = np.exp(pred_log_ptt)
 
         # Convert ms delay to sample index
-        delay_samples = int((pred_ptt_ms / 1000) * self.fs)
+        delay_samples = int((pred_ptt_ms) * self.fs)
         return r_peak_idx + delay_samples
 
     def find_waves_with_belief(self, ppg_signal, r_peaks, bps):
@@ -147,7 +154,7 @@ class PhysiologicalWaveFinder:
         """
         predictions = []
         # Search window +/- 40ms around the physical prediction
-        window_size = int(0.04 * self.fs)
+        window_size = int(40 * self.fs)
 
         for r_idx in r_peaks:
             t_pred_idx = self.get_physical_belief(bps, r_idx)
@@ -162,6 +169,6 @@ class PhysiologicalWaveFinder:
                     'r_peak': r_idx,
                     'predicted_idx': t_pred_idx,
                     'actual_idx': actual_idx,
-                    'error_ms': (actual_idx - t_pred_idx) * (1000 / self.fs)
+                    'error_ms': (actual_idx - t_pred_idx) * (1 / self.fs)
                 })
         return predictions

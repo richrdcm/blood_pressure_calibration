@@ -26,7 +26,7 @@ class DataLoader:
 
             # 3. Extract PPG Onsets ('a' waves are the Arrival)
             # We use a sharp derivative to find the pulse start
-            vpg = np.gradient(Preprocessor.clean_signal(ppg, fs))
+            vpg = np.gradient(Preprocessor.clean_ppg_signal(ppg, fs))
             ppg_onsets, _ = signal.find_peaks(vpg, distance=int(fs * 0.5), prominence=np.std(vpg) * 0.5)
             p_spikes = np.zeros(len(ppg))
             p_spikes[ppg_onsets] = 1
@@ -95,25 +95,34 @@ class DataLoader:
 
             if dataset_type == "mcs":
                 # --- MCS LOGIC: Asynchronous Interleaved ---
-                # Separate streams using flags
-                ecg_stream = group[group['is_ecg'] == 1][['standard_ts', raw_ecg_col]].sort_values('standard_ts')
-                ppg_stream = group[group['is_ppg'] == 1][['standard_ts', raw_ppg_col]].sort_values('standard_ts')
+                # Extract ECG where flag is 1 AND value is not zero / NaN
+                ecg_mask = (group['is_ecg'] == 1) & (group[raw_ecg_col] != 0) & (group[raw_ecg_col].notna())
+                ecg_stream = group[ecg_mask].sort_values('standard_ts')
+                ecg_timestamps = ecg_stream['standard_ts'].tolist()
+                final_ecg = ecg_stream[raw_ecg_col].tolist()
+
+                # Extract PPG where flag is 1 AND value is not zero / NaN
+                ppg_mask = (group['is_ppg'] == 1) & (group[raw_ppg_col] != 0) & (group[raw_ppg_col].notna())
+                ppg_stream = group[ppg_mask].sort_values('standard_ts')
+                ppg_timestamps = ppg_stream['standard_ts'].tolist()
+                final_ppg = ppg_stream[raw_ppg_col].tolist()
 
                 # Align PPG to ECG clock
-                synced_df = pd.merge_asof(
-                    ecg_stream, ppg_stream,
-                    left_on='standard_ts', right_on='standard_ts',
-                    direction='nearest', tolerance=50
-                ).dropna()
+                #synced_df = pd.merge_asof(
+                #    ecg_stream, ppg_stream,
+                #    left_on='standard_ts', right_on='standard_ts',
+                #    direction='nearest', tolerance=50
+                #).dropna()
 
-                final_ts = synced_df['standard_ts'].tolist()
-                final_ppg = synced_df[raw_ppg_col].tolist()
-                final_ecg = synced_df[raw_ecg_col].tolist()
+                #final_ts = synced_df['standard_ts'].tolist()
+                #final_ppg = synced_df[raw_ppg_col].tolist()
+                #final_ecg = synced_df[raw_ecg_col].tolist()
 
             else:
                 # --- UCI LOGIC: Synchronous Parallel ---
                 group = group.sort_values('standard_ts')
-                final_ts = group['standard_ts'].tolist()
+                ppg_timestamps = group['standard_ts'].tolist()
+                ecg_timestamps = group['standard_ts'].tolist()
                 final_ecg = group[raw_ecg_col].tolist()
 
                 # APPLY FIX: Align the PPG to the ECG before creating the sample
@@ -128,16 +137,21 @@ class DataLoader:
             # Typically MCS (Green) needs inversion, UCI (IR/Red) does not.
             # You can add an 'invert' flag to your config/mappings.py for this.
 
-            processed_ppg = np.negative(final_ppg).tolist() if dataset_type == "mcs" else final_ppg
+            if dataset_type == "mcs" and len(final_ppg) > 0:
+                # Applying the -signal + max() logic discussed earlier
+                final_ppg = (-np.array(final_ppg) + np.max(final_ppg)).tolist()
 
             sample = BPSample(
                 patient_id=str(pid),
-                timestamp=final_ts,
-                ppg=processed_ppg,
+                ppg_timestamps=ppg_timestamps,
+                ecg_timestamps=ecg_timestamps,
+                ppg=final_ppg,
                 ecg=final_ecg,
                 bps=float(group[raw_bps_col].dropna().iloc[0]),
                 bpd=float(group[raw_bpd_col].dropna().iloc[0]),
-                fs=config["target_fs"]
+                target_fs=config["target_fs"],
+                ppg_fs=config["channels"]["ppg"]["fs"],
+                ecg_fs=config["channels"]["ecg"]["fs"]
             )
             samples.append(sample)
 
@@ -154,7 +168,7 @@ class PulseDBStyleAligner:
             r_indices = r_peaks["ECG_R_Peaks"]
 
             # 2. Detect PPG Systolic Peaks
-            ppg_cleaned = Preprocessor.clean_signal(ppg, fs)
+            ppg_cleaned = Preprocessor.clean_ppg_signal(ppg, fs)
             # Use neurokit's ppg_findpeaks for consistency with PulseDB style
             ppg_info = nk.ppg_findpeaks(ppg_cleaned, sampling_rate=fs)
             p_indices = ppg_info["PPG_Peaks"]
@@ -191,7 +205,7 @@ class PulseDBStyleAligner:
 
             # Calculate mean observed delay after rhythm match
             # If it's still 'wrong' (R after a), we nudge by a constant physiological offset
-            test_vpg = np.gradient(Preprocessor.clean_signal(aligned_ppg, fs))
+            test_vpg = np.gradient(Preprocessor.clean_ppg_signal(aligned_ppg, fs))
             # Find the first valid onset after the first R-peak
             first_r = r_indices[2]  # skip first two for stability
             search_area = test_vpg[first_r:first_r + int(fs * 0.6)]
