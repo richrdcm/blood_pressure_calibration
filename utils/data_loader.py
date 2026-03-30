@@ -5,158 +5,250 @@ from scipy import signal
 from schemas.bp_schema import BPSample
 from config.mappings import DATASET_CONFIGS
 from utils.preprocessing import Preprocessor
+import os
 
 
 class DataLoader:
+
     @staticmethod
-    def _align_uci_signals(ppg, ecg, fs):
-        """
-        Forces alignment based on physiological PTT constraints (100ms - 500ms).
-        """
+    def _append_sample(
+            group: pd.DataFrame,
+            pid: str,
+            bps: float,
+            bpd: float,
+            samples: list,
+            dataset_type: str,
+            raw_ppg_col: str,
+            raw_ecg_col: str,
+            config: dict,
+    ):
+        """Extracts PPG/ECG from a group slice and appends a BPSample."""
+        group = group.copy()
+
+        # Re-zero timestamps so each extracted interval perfectly starts at 0
+        group['standard_ts'] = group['standard_ts'] - group['standard_ts'].min()
+
+        if dataset_type == "mcs":
+            if raw_ecg_col in group.columns:
+                ecg_mask = (group[raw_ecg_col] != 0) & (group[raw_ecg_col].notna())
+                ecg_stream = group[ecg_mask].sort_values('standard_ts')
+                ecg_timestamps = ecg_stream['standard_ts'].tolist()
+                final_ecg = ecg_stream[raw_ecg_col].tolist()
+            else:
+                ecg_timestamps = []
+                final_ecg = []
+
+            ppg_mask = (group[raw_ppg_col] != 0) & (group[raw_ppg_col].notna())
+            ppg_stream = group[ppg_mask].sort_values('standard_ts')
+            ppg_timestamps = ppg_stream['standard_ts'].tolist()
+            final_ppg = ppg_stream[raw_ppg_col].tolist()
+
+        else:
+            group = group.sort_values('standard_ts')
+            ppg_timestamps = group['standard_ts'].tolist()
+            ecg_timestamps = group['standard_ts'].tolist()
+            final_ecg = group[raw_ecg_col].tolist()
+            final_ppg = group[raw_ppg_col].tolist()
+
+        if dataset_type == "mcs" and len(final_ppg) > 0:
+            final_ppg = (-np.array(final_ppg) + np.max(final_ppg)).tolist()
+
+        samples.append(BPSample(
+            patient_id=str(pid),
+            ppg_timestamps=ppg_timestamps,
+            ecg_timestamps=ecg_timestamps if ecg_timestamps else None,
+            ppg=final_ppg,
+            ecg=final_ecg if final_ecg else None,
+            bps=bps,
+            bpd=bpd,
+            target_fs=config["target_fs"],
+            ppg_fs=config["channels"]["ppg"]["fs"],
+            ecg_fs=config["channels"]["ecg"]["fs"],
+        ))
+
+    @staticmethod
+    def _parse_bp_reference(bp_ref_path: str) -> pd.DataFrame:
+        """Parses a BP reference CSV."""
         try:
-            # 1. Standardize inputs
-            ppg = np.array(ppg)
-            ecg = np.array(ecg)
+            try:
+                df = pd.read_csv(bp_ref_path, sep=';')
+            except Exception:
+                df = pd.read_csv(bp_ref_path, sep=',')
 
-            # 2. Extract ECG R-Peaks (The Trigger)
-            ecg_cleaned = nk.ecg_clean(ecg, sampling_rate=fs)
-            _, r_info = nk.ecg_peaks(ecg_cleaned, sampling_rate=fs)
-            r_spikes = np.zeros(len(ecg))
-            r_spikes[r_info["ECG_R_Peaks"]] = 1
+            df.columns = [c.strip() for c in df.columns]
+            cols = list(df.columns)
 
-            # 3. Extract PPG Onsets ('a' waves are the Arrival)
-            # We use a sharp derivative to find the pulse start
-            vpg = np.gradient(Preprocessor.clean_ppg_signal(ppg, fs))
-            ppg_onsets, _ = signal.find_peaks(vpg, distance=int(fs * 0.5), prominence=np.std(vpg) * 0.5)
-            p_spikes = np.zeros(len(ppg))
-            p_spikes[ppg_onsets] = 1
+            if len(cols) < 4:
+                print(f"[BP Ref] ERROR: expected 4 columns, got {len(cols)}")
+                return pd.DataFrame()
 
-            # 4. Cross-Correlate the Spikes
-            # This finds the best 'global' shift to align all heartbeats
-            corr = signal.correlate(p_spikes, r_spikes, mode='same')
-            lags = signal.correlation_lags(len(p_spikes), len(r_spikes), mode='same')
+            date_col, time_col, bps_col, bpd_col = cols[0], cols[1], cols[2], cols[3]
 
-            # 5. Define the "Physiological Search Window"
-            # We want to find the shift that results in an R -> a delay of ~200ms
-            # In UCI, the hardware lag can be +/- 1 second.
-            # We search for the best correlation within +/- 1.5 seconds
-            search_limit = int(1.5 * fs)
-            mask = (lags > -search_limit) & (lags < search_limit)
+            df['datetime'] = pd.to_datetime(
+                df[date_col].astype(str).str.strip() + ' ' +
+                df[time_col].astype(str).str.strip(),
+                dayfirst=True,
+                errors='coerce',
+            )
+            df['bps'] = pd.to_numeric(df[bps_col], errors='coerce')
+            df['bpd'] = pd.to_numeric(df[bpd_col], errors='coerce')
 
-            # Find the lag that maximizes peak alignment
-            best_lag = lags[mask][np.argmax(corr[mask])]
-
-            # 6. Apply the shift
-            # This aligns the signals so index 'i' in both signals refers to the same moment
-            aligned_ppg = np.roll(ppg, -best_lag)
-
-            print(f"--- UCI SYNC FIX ---")
-            print(f"Detected Hardware/Buffer Offset: {best_lag} samples ({(best_lag / fs) * 1000:.1f}ms)")
-            print(f"Action: Shifting PPG by {-best_lag} samples to align with ECG.")
-
-            return aligned_ppg.tolist()
+            df = df[['datetime', 'bps', 'bpd']].dropna().sort_values('datetime').reset_index(drop=True)
+            print(f"[BP Ref] Loaded {len(df)} BP reference readings from '{bp_ref_path}'")
+            return df
 
         except Exception as e:
-            print(f"Alignment Error: {e}")
-            return ppg.tolist()
+            print(f"[BP Ref] Failed to parse BP reference file: {e}")
+            return pd.DataFrame()
 
     @staticmethod
-    def load_from_csv(file_path: str, dataset_type: str, max_duration_sec: float = None) -> list:
-        config = DATASET_CONFIGS[dataset_type]
-        raw_df = pd.read_csv(file_path)
+    def load_from_csv(
+            file_path: str,
+            dataset_type: str,
+            max_duration_msec: float = None,
+            index_from: int = None,
+            index_to: int = None,
+            each_file_is_own_patient: bool = True,
+            bp_ref_path: str = None
+    ) -> list:
 
-        # Get standardized column names from config
-        # We find which raw column maps to our internal 'timestamp', 'ppg', etc.
+        # ── Build file list ──
+        if index_from is not None and index_to is not None:
+            paths = [f"{file_path}_{i}.csv" for i in range(index_from, index_to + 1) if
+                     os.path.isfile(f"{file_path}_{i}.csv")]
+            if not paths:
+                print("[load_from_csv] No files found in the given range.")
+                return []
+        else:
+            paths = [file_path]
+
+        # ── Load BP reference ──
+        bp_ref_df = DataLoader._parse_bp_reference(bp_ref_path) if bp_ref_path else pd.DataFrame()
+
+        config = DATASET_CONFIGS[dataset_type]
         inv_map = {v: k for k, v in config["columns"].items()}
         raw_ts_col = inv_map['timestamp']
-
-        if max_duration_sec is not None:
-            # We determine the end time based on the first timestamp
-            start_time = raw_df[raw_ts_col].min()
-            # Convert max_duration back to raw units if necessary
-            # (e.g., if UCI is in seconds, 10s = 10 units. If MCS is in ms, 10s = 10,000 units)
-            duration_in_raw_units = max_duration_sec / config["unit_conversion"]["timestamp"]
-            end_time = start_time + duration_in_raw_units
-
-            raw_df = raw_df[raw_df[raw_ts_col] <= end_time].copy()
-            print(f"Testing Mode: Truncated {dataset_type} to {max_duration_sec}s ({len(raw_df)} rows)")
-
         raw_pid_col = inv_map['patient_id']
+        unit_conv = config["unit_conversion"]["timestamp"]
+        prefix_stem = os.path.splitext(os.path.basename(file_path))[0]
+
+        # ── Load and concatenate all files ──
+        frames = []
+        for p in paths:
+            df = pd.read_csv(p)
+            file_stem = os.path.splitext(os.path.basename(p))[0]
+
+            df = df.drop_duplicates(subset=[raw_ts_col], keep='first')
+
+            if raw_pid_col not in df.columns:
+                df[raw_pid_col] = file_stem if each_file_is_own_patient else prefix_stem
+            elif not each_file_is_own_patient:
+                df[raw_pid_col] = prefix_stem
+
+            # Convert raw timestamp to absolute datetime
+            raw_ts_sec = df[raw_ts_col] / 1000.0 if dataset_type == "mcs" else df[raw_ts_col]
+            df['abs_datetime'] = pd.to_datetime(raw_ts_sec, unit='s')
+
+            if bp_ref_df.empty and max_duration_msec is not None:
+                start_time = df[raw_ts_col].min()
+                duration_in_raw_units = max_duration_msec * unit_conv
+                df = df[df[raw_ts_col] <= (start_time + duration_in_raw_units)].copy()
+                print(f"[load_from_csv] {file_stem}: truncated to {max_duration_msec}ms")
+
+            # Standardize relative timestamps
+            last_ts = frames[-1]['standard_ts'].max() if (not each_file_is_own_patient and frames) else 0.0
+            df['standard_ts'] = ((df[raw_ts_col] - df[raw_ts_col].min()) * unit_conv) + last_ts
+            df = df.drop_duplicates(subset=['standard_ts'], keep='first')
+
+            frames.append(df)
+
+        raw_df = pd.concat(frames, ignore_index=True).sort_values('abs_datetime')
+
         raw_ppg_col = inv_map['ppg']
         raw_ecg_col = inv_map['ecg']
         raw_bps_col = inv_map['bps']
         raw_bpd_col = inv_map['bpd']
 
-        # 1. Standardize Timestamps using the config conversion
-        raw_df['standard_ts'] = (raw_df[raw_ts_col] - raw_df[raw_ts_col].min()) * config["unit_conversion"]["timestamp"]
-
         samples = []
-        for pid, group in raw_df.groupby(raw_pid_col):
 
-            if dataset_type == "mcs":
-                # --- MCS LOGIC: Asynchronous Interleaved ---
-                # Extract ECG where flag is 1 AND value is not zero / NaN
-                ecg_mask = (group['is_ecg'] == 1) & (group[raw_ecg_col] != 0) & (group[raw_ecg_col].notna())
-                ecg_stream = group[ecg_mask].sort_values('standard_ts')
-                ecg_timestamps = ecg_stream['standard_ts'].tolist()
-                final_ecg = ecg_stream[raw_ecg_col].tolist()
+        for file_idx, (pid, group) in enumerate(raw_df.groupby(raw_pid_col), start=1):
+            group_sorted = group.sort_values('abs_datetime')
 
-                # Extract PPG where flag is 1 AND value is not zero / NaN
-                ppg_mask = (group['is_ppg'] == 1) & (group[raw_ppg_col] != 0) & (group[raw_ppg_col].notna())
-                ppg_stream = group[ppg_mask].sort_values('standard_ts')
-                ppg_timestamps = ppg_stream['standard_ts'].tolist()
-                final_ppg = ppg_stream[raw_ppg_col].tolist()
+            if not bp_ref_df.empty:
+                window_ms = max_duration_msec if max_duration_msec else 60000
+                window_td = pd.Timedelta(milliseconds=window_ms)
 
-                # Align PPG to ECG clock
-                #synced_df = pd.merge_asof(
-                #    ecg_stream, ppg_stream,
-                #    left_on='standard_ts', right_on='standard_ts',
-                #    direction='nearest', tolerance=50
-                #).dropna()
+                # Filter to only the BPs that happened during/after the recording started
+                bp_in_window = bp_ref_df[bp_ref_df['datetime'] >= group_sorted['abs_datetime'].min()].reset_index(
+                    drop=True)
 
-                #final_ts = synced_df['standard_ts'].tolist()
-                #final_ppg = synced_df[raw_ppg_col].tolist()
-                #final_ecg = synced_df[raw_ecg_col].tolist()
+                # We use the recording start as the very first lower boundary
+                boundaries = [group_sorted['abs_datetime'].min()] + bp_in_window['datetime'].tolist()
+
+                for i, bp_row in bp_in_window.iterrows():
+                    bp_dt = bp_row['datetime']
+                    bps = float(bp_row['bps'])
+                    bpd = float(bp_row['bpd'])
+
+                    # 1. Define the BROAD safe zone: Between the last BP reading (or start) and this BP reading
+                    broad_start = boundaries[i]
+                    broad_end = bp_dt
+
+                    mask = (group_sorted['abs_datetime'] >= broad_start) & (group_sorted['abs_datetime'] <= broad_end)
+                    broad_group = group_sorted[mask]
+
+                    if len(broad_group) < 10:
+                        print(
+                            f"[BP Ref] Warning: File {file_idx} (Patient {pid}) lacks any signal data in the interval before {bp_dt}. Skipping.")
+                        continue
+
+                    # 2. Find the VERY LAST recorded data point in this broad zone
+                    actual_last_dt = broad_group['abs_datetime'].max()
+
+                    # 3. Snap the 60-second window to exactly end at that last available point
+                    target_start_dt = actual_last_dt - window_td
+
+                    final_group = broad_group[broad_group['abs_datetime'] >= target_start_dt]
+
+                    if len(final_group) < 10:
+                        print(
+                            f"[BP Ref] Warning: Patient {pid}_bp_reading_{i + 1} lacks sufficient signal data ending at {actual_last_dt}. Skipping.")
+                        continue
+
+                    time_gap = (bp_dt - actual_last_dt).total_seconds()
+                    print(f"[load_from_csv] Patient {pid}_bp_reading_{i + 1} matched BP at {bp_dt}: SBP={bps}, DBP={bpd}.")
+
+                    if time_gap > 10:
+                        print(
+                            f"    -> NOTE: Data dropped out early! Extracted {window_ms / 1000}s ending {time_gap:.1f}s BEFORE the actual BP reading.")
+                    else:
+                        print(
+                            f"    -> Extracted fresh {window_ms / 1000}s ending directly at {actual_last_dt} ({time_gap:.1f}s gap). Rows={len(final_group)}")
+
+                    DataLoader._append_sample(
+                        group=final_group,
+                        pid=f"{pid}_bp_reading_{i + 1}",
+                        bps=bps,
+                        bpd=bpd,
+                        samples=samples,
+                        dataset_type=dataset_type,
+                        raw_ppg_col=raw_ppg_col,
+                        raw_ecg_col=raw_ecg_col,
+                        config=config
+                    )
 
             else:
-                # --- UCI LOGIC: Synchronous Parallel ---
-                group = group.sort_values('standard_ts')
-                ppg_timestamps = group['standard_ts'].tolist()
-                ecg_timestamps = group['standard_ts'].tolist()
-                final_ecg = group[raw_ecg_col].tolist()
+                # ── No BP reference — single sample ──
+                bps_series = group[raw_bps_col].dropna() if raw_bps_col in group.columns else pd.Series(dtype=float)
+                bpd_series = group[raw_bpd_col].dropna() if raw_bpd_col in group.columns else pd.Series(dtype=float)
+                bps = float(bps_series.iloc[0]) if not bps_series.empty else None
+                bpd = float(bpd_series.iloc[0]) if not bpd_series.empty else None
 
-                # APPLY FIX: Align the PPG to the ECG before creating the sample
-                raw_ppg = group[raw_ppg_col].values
-                final_ppg = PulseDBStyleAligner.align(
-                    raw_ppg,
-                    np.array(final_ecg),
-                    config["target_fs"]
-                )
+                DataLoader._append_sample(group_sorted, str(pid), bps, bpd, samples, dataset_type, raw_ppg_col,
+                                          raw_ecg_col, config)
 
-            # 2. Create Pydantic Sample (Invert PPG if it's the green channel)
-            # Typically MCS (Green) needs inversion, UCI (IR/Red) does not.
-            # You can add an 'invert' flag to your config/mappings.py for this.
-
-            if dataset_type == "mcs" and len(final_ppg) > 0:
-                # Applying the -signal + max() logic discussed earlier
-                final_ppg = (-np.array(final_ppg) + np.max(final_ppg)).tolist()
-
-            sample = BPSample(
-                patient_id=str(pid),
-                ppg_timestamps=ppg_timestamps,
-                ecg_timestamps=ecg_timestamps,
-                ppg=final_ppg,
-                ecg=final_ecg,
-                bps=float(group[raw_bps_col].dropna().iloc[0]),
-                bpd=float(group[raw_bpd_col].dropna().iloc[0]),
-                target_fs=config["target_fs"],
-                ppg_fs=config["channels"]["ppg"]["fs"],
-                ecg_fs=config["channels"]["ecg"]["fs"]
-            )
-            samples.append(sample)
-
+        print(f"[load_from_csv] Successfully generated {len(samples)} sample(s).")
         return samples
-
 
 class PulseDBStyleAligner:
     @staticmethod
@@ -226,3 +318,4 @@ class PulseDBStyleAligner:
         except Exception as e:
             print(f"PulseDB Alignment failed: {e}")
             return ppg
+

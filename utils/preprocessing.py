@@ -1,4 +1,5 @@
 import numpy as np
+from neurokit2 import ecg_clean
 from scipy import signal
 from scipy.interpolate import interp1d
 from scipy.signal import resample
@@ -6,6 +7,7 @@ from schemas.bp_schema import BPSample
 import pandas as pd
 import heartpy as hp
 import neurokit2 as nk
+from src.extractor.sqi import ECGSQA, PPGSQA
 
 
 class Preprocessor:
@@ -15,16 +17,14 @@ class Preprocessor:
         """
         cleaned = []
         for sample in samples:
+            # 1. Resample both signals to target_fs
             ppg_time, clean_ppg = self.clean_ppg_signal(sample)
             ecg_time, clean_ecg = self.clean_ecg_signal(sample)
 
-            # 2. Convert to Pandas DataFrames for alignment
+            # 2. Sync PPG to ECG clock FIRST
             df_ecg = pd.DataFrame({'time': ecg_time, 'ecg': clean_ecg})
             df_ppg = pd.DataFrame({'time': ppg_time, 'ppg': clean_ppg})
 
-            # 3. Align PPG to ECG clock
-            # Note: If your timestamps are in seconds, a tolerance of 0.05 (50ms) is standard.
-            # If your timestamps are in milliseconds, use tolerance=50.
             synced_df = pd.merge_asof(
                 df_ecg,
                 df_ppg,
@@ -33,70 +33,60 @@ class Preprocessor:
                 tolerance=50
             ).dropna()
 
-            # 4. Extract the strictly overlapping, synchronized arrays
-            final_ts = synced_df['time'].tolist()
-            final_ecg = synced_df['ecg'].tolist()
-            final_ppg = synced_df['ppg'].tolist()
+            final_ts = synced_df['time'].to_numpy()
+            final_ecg = synced_df['ecg'].to_numpy()
+            final_ppg = synced_df['ppg'].to_numpy()
 
-            # 5. Create the unified BPSample
+            # 3. SQI on the synced signals — indices now match final_ts/final_ppg/final_ecg
+            ppg_sqi = PPGSQA(fs=sample.target_fs, min_time_ms=2000).compute(final_ppg) if len(final_ppg) > 0 else []
+            ecg_sqi = ECGSQA(fs=sample.target_fs, min_time_ms=2000).compute(final_ecg) if len(final_ecg) > 0 else []
+            joint_sqi = self.intersect_sqi_intervals(ppg_sqi, ecg_sqi, min_time_ms=2000, fs=sample.target_fs)
+
+            print(f"[SQI] Patient {sample.patient_id}: "
+                  f"PPG={len(ppg_sqi)} intervals, "
+                  f"ECG={len(ecg_sqi)} intervals, "
+                  f"Joint={len(joint_sqi)} intervals")
+
+            # 4. Build cleaned sample
             clean_sample = BPSample(
                 patient_id=str(sample.patient_id),
-                ppg_timestamps=final_ts,  # Now unified!
-                ecg_timestamps=final_ts,  # Now unified!
-                ppg=final_ppg,
-                ecg=final_ecg,
+                ppg_timestamps=final_ts.tolist(),
+                ecg_timestamps=final_ts.tolist(),
+                ppg=final_ppg.tolist(),
+                ecg=final_ecg.tolist(),
                 bps=sample.bps,
                 bpd=sample.bpd,
                 target_fs=sample.target_fs,
                 ppg_fs=sample.target_fs,
                 ecg_fs=sample.target_fs,
+                ppg_sqi=ppg_sqi,
+                ecg_sqi=ecg_sqi,
+                joint_sqi=joint_sqi,
             )
             cleaned.append(clean_sample)
 
         return cleaned
 
-    @staticmethod
-    def clean_ecg_signal(sample: BPSample) -> tuple:
+    def clean_ecg_signal(self, sample: BPSample) -> tuple:
         # 1. Resample ECG
-        time, resampled = Preprocessor.resample_signal(data=sample.ecg,
-                                                       timestamps=sample.ecg_timestamps,
-                                                       target_fs=sample.target_fs)
+        if sample.ecg:
+            time, resampled = self.resample_signal(data=sample.ecg,
+                                                   timestamps=sample.ecg_timestamps,
+                                                   target_fs=sample.target_fs)
 
-        ecg_cleaned = nk.ecg_clean(resampled, sampling_rate=sample.target_fs, method="neurokit")
+            ecg_cleaned = nk.ecg_clean(resampled, sampling_rate=sample.target_fs, method="neurokit")
+        else:
+            time = np.asarray([])
+            ecg_cleaned = np.asarray([])
         return time, ecg_cleaned
 
-    @staticmethod
-    def clean_ppg_signal(sample_or_array, fs: int = None) -> tuple:
+    def clean_ppg_signal(self, sample) -> tuple:
         """
         Resamples, filters, and normalizes the PPG signal using NeuroKit2's optimized pipeline.
-
-        Can be called in two ways:
-          - clean_ppg_signal(sample: BPSample)            — standard pipeline with resampling
-          - clean_ppg_signal(ppg_array, fs)               — lightweight path for raw arrays
         """
-        # --- Overloaded entry point ---
-        if fs is not None:
-            # Called as clean_ppg_signal(array, fs): skip resampling, just filter + normalize
-            ppg_array = np.array(sample_or_array)
-            cleaned_ppg = nk.ppg_clean(
-                nk.as_vector(ppg_array),
-                sampling_rate=fs,
-                method="elgendi"
-            )
-            norm = nk.rescale(cleaned_ppg, to=[0, 1])
-            fake_timestamps = np.arange(len(norm)) / fs * 1000.0  # ms
-            return fake_timestamps, norm.tolist()
-
-        # --- Standard BPSample path ---
-        sample = sample_or_array
-
-        # 1. Standardize the Sampling Rate based on true timestamps
-        time, resampled = Preprocessor.resample_signal(
-            data=sample.ppg,
-            timestamps=sample.ppg_timestamps,
-            target_fs=sample.target_fs
-        )
-
+        time, resampled = self.resample_signal(data=sample.ppg,
+                                               timestamps=sample.ppg_timestamps,
+                                               target_fs=sample.target_fs)
         # 2. Clean using NeuroKit2 (This safely handles the 0.5-8.0 Hz bandpass internally)
         cleaned_ppg = nk.ppg_clean(
             nk.as_vector(resampled),
@@ -107,14 +97,17 @@ class Preprocessor:
         # 3. Normalize to [0, 1] safely
         norm = nk.rescale(cleaned_ppg, to=[0, 1])
 
-        return time, norm.tolist()
+        return time, norm
 
-    @staticmethod
-    def clean_ppg_signal_cheby(sample) -> tuple:
+    def clean_ppg_signal_cheby(self, sample) -> tuple:
         """
         Alternative PPG cleaning method using Chebyshev Type II filter
         and Moving Average smoothing. Interchangeable with clean_ppg_signal.
         """
+        time, resampled = self.resample_signal(data=sample.ppg,
+                                               timestamps=sample.ppg_timestamps,
+                                               target_fs=sample.target_fs)
+
         fs = sample.ppg_fs
 
         # 1. Determine the Nyquist Limit
@@ -128,7 +121,7 @@ class Preprocessor:
 
         order = 4
         b, a = signal.cheby2(order, rs=20, Wn=[fL, fH], btype='bandpass', fs=fs)
-        ppg_cb2 = signal.filtfilt(b, a, sample.ppg)
+        ppg_cb2 = signal.filtfilt(b, a, resampled)
 
         # 3. Moving Average Smoothing (50ms window for the main PPG)
         if fs >= 75:
@@ -142,11 +135,7 @@ class Preprocessor:
         import neurokit2 as nk
         norm = nk.rescale(cleaned_ppg, to=[0, 1])
 
-        # Ensure timestamps are returned as a standard list
-        timestamps = sample.ppg_timestamps.tolist() if hasattr(sample.ppg_timestamps, 'tolist') else list(
-            sample.ppg_timestamps)
-
-        return timestamps, norm.tolist()
+        return time, norm.tolist()
 
     @staticmethod
     def resample_signal(data: list, timestamps: list, target_fs: float) -> tuple[np.ndarray, np.ndarray]:
@@ -182,6 +171,54 @@ class Preprocessor:
 
         return new_timestamps, new_data
 
+    @staticmethod
+    def intersect_sqi_intervals(
+            ppg_sqi: list,
+            ecg_sqi: list,
+            min_time_ms: float = 2000,
+            fs: float = 125,
+    ) -> list:
+        """
+        Returns intervals where BOTH PPG and ECG quality are good.
+
+        Parameters
+        ----------
+        ppg_sqi      : list of [start, end] index pairs from PPGSQI
+        ecg_sqi      : list of [start, end] index pairs from ECGSQI
+        min_time_ms  : minimum duration of a valid intersection in ms
+        fs           : sampling frequency — used to convert min_time_ms to samples
+
+        Returns
+        -------
+        List of [start, end] index pairs where both signals are usable.
+        """
+        min_samples = int(min_time_ms * fs / 1000)
+        intersections = []
+
+        for p_start, p_end in ppg_sqi:
+            for e_start, e_end in ecg_sqi:
+                # Overlap = max of starts, min of ends
+                i_start = max(p_start, e_start)
+                i_end = min(p_end, e_end)
+
+                if i_end > i_start and (i_end - i_start) >= min_samples:
+                    intersections.append([i_start, i_end])
+
+        # Merge adjacent or overlapping intersections
+        if not intersections:
+            return []
+
+        intersections.sort(key=lambda x: x[0])
+        merged = [intersections[0]]
+        for current in intersections[1:]:
+            last = merged[-1]
+            if current[0] <= last[1] + 1:
+                last[1] = max(last[1], current[1])
+            else:
+                merged.append(current)
+
+        return merged
+
 
 def remap_fiducial_indices(colleague_csv_path, raw_timestamps, clean_timestamps, old_ppg_wave):
     """
@@ -195,10 +232,8 @@ def remap_fiducial_indices(colleague_csv_path, raw_timestamps, clean_timestamps,
     """
     import os
     if not os.path.exists(colleague_csv_path):
-        raise FileNotFoundError(
-            f"Colleague fiducial CSV not found: '{colleague_csv_path}'. "
-            "Pass a valid path or set colleague_csv_path=None to skip remapping."
-        )
+        print(f"Error: Colleague CSV not found at {colleague_csv_path}")
+        return
 
     df_coll = pd.read_csv(colleague_csv_path)
 
@@ -250,3 +285,4 @@ def remap_fiducial_indices(colleague_csv_path, raw_timestamps, clean_timestamps,
     new_ppg_wave = (old_ppg_wave[0], old_ppg_wave[1], results)
 
     return new_ppg_wave
+

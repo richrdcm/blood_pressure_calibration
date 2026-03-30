@@ -9,109 +9,124 @@ from scipy.stats import norm
 # Internal imports from your project
 from src.extractor.morphology import MorphologyExtractor
 from src.extractor.times import TimeExtractor
-from src.calibrator.SubjectCalibrator import SubjectCalibrator, FeatureExporter
 from utils.preprocessing import Preprocessor
+import os
 
 
 class Visualizator:
     @staticmethod
-    def plot_signals(sample: BPSample, clean_sample: BPSample):
-        # Prepare PPG (ensure length matches timestamp)
+    def plot_signals(sample: BPSample, clean_sample: BPSample, test_name, show=True):
         ppg_raw = sample.ppg
         ppg_proc = clean_sample.ppg
-
         ecg_raw = sample.ecg
         ecg_proc = clean_sample.ecg
+        has_ecg = ecg_raw is not None
 
-        # Create Figure
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.1,
-                            subplot_titles=("PPG Signal (Green Channel)", "ECG Signal (Lead II)"))
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            vertical_spacing=0.1,
+            subplot_titles=("PPG Signal (Green Channel)", "ECG Signal (Lead II)")
+        )
 
-        # --- PPG TRACES (Row 1) ---
-        # Use master_len to ensure x and y match
-        fig.add_trace(go.Scatter(x=sample.ppg_timestamps, y=ppg_raw, name="Raw PPG"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=clean_sample.ppg_timestamps, y=ppg_proc, name="Processed PPG", visible=False),
-                      row=1, col=1)
+        # ── SIGNAL TRACES ─────────────────────────────────────────────────────────
+        fig.add_trace(go.Scatter(
+            x=sample.ppg_timestamps, y=ppg_raw, name="Raw PPG"
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=clean_sample.ppg_timestamps, y=ppg_proc, name="Processed PPG", visible=False
+        ), row=1, col=1)
 
-        # --- ECG TRACES (Row 2) ---
-        if ecg_raw is not None:
-            fig.add_trace(go.Scatter(x=sample.ecg_timestamps, y=ecg_raw, name="Raw ECG",
-                                     line=dict(color='#FF0000', width=1)), row=2, col=1)
-            fig.add_trace(go.Scatter(x=clean_sample.ecg_timestamps, y=ecg_proc, name="Processed ECG",
-                                     line=dict(color='#8B0000', width=1.5), visible=False), row=2, col=1)
+        if has_ecg:
+            fig.add_trace(go.Scatter(
+                x=sample.ecg_timestamps, y=ecg_raw, name="Raw ECG",
+                line=dict(color='#FF0000', width=1)
+            ), row=2, col=1)
+            fig.add_trace(go.Scatter(
+                x=clean_sample.ecg_timestamps, y=ecg_proc, name="Processed ECG",
+                line=dict(color='#8B0000', width=1.5), visible=False
+            ), row=2, col=1)
 
-        # --- DROP-DOWN SELECTOR (Raw vs Processed) ---
-        dropdown_buttons = [
-            dict(label="Show Raw",
-                 method="update",
-                 args=[{"visible": [True, False, True, False]},
-                       {"title": f"Raw Signal Analysis - Patient {sample.patient_id}"}]),
-            dict(label="Show Processed",
-                 method="update",
-                 args=[{"visible": [False, True, False, True]},
-                       {"title": f"Filtered/Normalized Analysis - Patient {sample.patient_id}"}]),
-        ]
+        # ── JOINT SQI SHADING (both rows) ─────────────────────────────────────────
+        ts = clean_sample.ppg_timestamps
+        if clean_sample.joint_sqi:
+            for i, (s, e) in enumerate(clean_sample.joint_sqi):
+                if s >= len(ts) or e >= len(ts):
+                    continue
+                for row in ([1, 2] if has_ecg else [1]):
+                    fig.add_vrect(
+                        x0=ts[s], x1=ts[e],
+                        fillcolor='rgba(0, 255, 100, 0.18)',
+                        opacity=1.0, layer="below", line_width=0,
+                        row=row, col=1,
+                    )
 
-        # --- UPDATE LAYOUT WITH SLIDER ---
+        # ── JOINT SQI LEGEND ENTRY ────────────────────────────────────────────────
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode='markers',
+            marker=dict(size=14, color='rgba(0, 255, 100, 0.85)', symbol='square'),
+            name="PPG + ECG good (joint SQI)",
+        ), row=1, col=1)
+
+        # ── LAYOUT ────────────────────────────────────────────────────────────────
+        n_traces = 2 + (2 if has_ecg else 0)  # signal traces count
+        raw_vis = [True, False] + ([True, False] if has_ecg else []) + [True]
+        proc_vis = [False, True] + ([False, True] if has_ecg else []) + [True]
+
         fig.update_layout(
-            # 1. SET GLOBAL TITLE
-            title={
-                'text': f"BP Calibration Dashboard - Patient {sample.patient_id}",
-                'y': 0.95,  # Vertical position (0 to 1)
-                'x': 0.5,  # Horizontal position (0.5 is center)
-                'xanchor': 'center',
-                'yanchor': 'top',
-                'font': dict(size=24)
-            },
-
-            # 2. UPDATEMENUS (Ensure 'title' here also updates the global title)
+            title=dict(
+                text=f"BP Calibration Dashboard - Patient {sample.patient_id}",
+                y=0.95, x=0.5, xanchor='center', yanchor='top',
+                font=dict(size=24),
+            ),
             updatemenus=[dict(
                 buttons=[
                     dict(label="Show Raw",
                          method="update",
-                         args=[{"visible": [True, False, True, False]},
+                         args=[{"visible": raw_vis},
                                {"title.text": f"Raw Signals - Patient {sample.patient_id}"}]),
-                    # Updates the global title text
                     dict(label="Show Processed",
                          method="update",
-                         args=[{"visible": [False, True, False, True]},
+                         args=[{"visible": proc_vis},
                                {"title.text": f"Preprocessed Signals - Patient {sample.patient_id}"}]),
                 ],
-                direction="down",
-                showactive=True,
-                x=0.01,  # Moves the menu to the top left
-                y=1.15
+                direction="down", showactive=True,
+                x=0.01, y=1.15,
             )],
-
             template="plotly_dark",
             height=800,
             showlegend=True,
-
-            # X-Axis Slider configuration
             xaxis2=dict(
-                title="Time (milliseconds)",  # Updated Label
+                title="Time (milliseconds)",
                 rangeslider=dict(visible=True, thickness=0.05),
                 rangeselector=dict(
-                    buttons=list([
+                    buttons=[
                         dict(count=500, label="500ms", step="all", stepmode="backward"),
                         dict(count=1000, label="1s", step="all", stepmode="backward"),
                         dict(count=5000, label="5s", step="all", stepmode="backward"),
-                        dict(step="all", label="Full Window")
-                    ]),
-                    y=1.02
-                )
-            )
+                        dict(step="all", label="Full Window"),
+                    ],
+                    y=1.02,
+                ),
+            ),
         )
 
-        # Ensure the subplots don't overlap with the slider
         fig.update_yaxes(title_text="Amplitude", row=1, col=1)
         fig.update_yaxes(title_text="Amplitude", row=2, col=1)
 
-        fig.show()
+        # ── SAVE ──────────────────────────────────────────────────────────────────
+        base_name = f"plot_signals_{sample.patient_id}"
+        output_path = "test/" + test_name + "/" + f"{base_name}.html"
+        counter = 1
+        while os.path.exists(output_path):
+            output_path = f"{base_name}_{counter}.html"
+            counter += 1
+        fig.write_html(output_path)
+        print(f"Saved plot to: {output_path}")
+        if show:
+            fig.show()
 
     @staticmethod
-    def plot_morphology_from_ecg(cleaned_sample: BPSample, ppg_wave: list, time_feature: list):
+    def plot_morphology_from_ecg(cleaned_sample: BPSample, ppg_wave: list, time_feature: list, test_name, show=True):
         ppg_proc = np.asarray(cleaned_sample.ppg)
         ecg_proc = np.asarray(cleaned_sample.ecg)
         target_fs = cleaned_sample.target_fs
@@ -188,16 +203,22 @@ class Visualizator:
                 showlegend=False
             ), row=1, col=1)
 
-            # C. Diastolic Peak (Cyan Star)
-            if f['ptt_dia']:
-                dp_idx = int(f['r_peak'] + (f['ptt_dia'] * target_fs / 1000))
+            # C. Diastolic Peak (Cyan Star) — use dp index directly from wave dict
+            w = next((x for x in waves if x.get('a') == f.get('a_idx')), None)
+            if w is not None and w.get('dp') is not None:
+                dp_idx = w['dp']
                 if dp_idx < len(ppg_time):
                     fig.add_trace(go.Scatter(
                         x=[ppg_time[dp_idx]], y=[ppg_proc[dp_idx]],
                         mode='markers',
-                        marker=dict(symbol='star', size=12, color='cyan', line=dict(width=1, color='black')),
+                        marker=dict(symbol='star', size=12, color='cyan',
+                                    line=dict(width=1, color='black')),
                         name='Diastolic Peak',
-                        hovertemplate=f"<b>Diastolic Peak</b><br>PTT_dia: {f['ptt_dia']}ms<br>Global: %{{x}}ms<extra></extra>",
+                        hovertemplate=(
+                            f"<b>Diastolic Peak</b><br>"
+                            f"PTT_dia: {f.get('ptt_dia')}ms<br>"
+                            f"Global: %{{x}}ms<extra></extra>"
+                        ),
                         showlegend=False
                     ), row=1, col=1)
 
@@ -209,11 +230,20 @@ class Visualizator:
             hovermode="closest",
             xaxis2=dict(title="Time (ms)", rangeslider=dict(visible=True, thickness=0.05))
         )
-
-        fig.show()
+        # ── SAVE ──────────────────────────────────────────────────────────────────
+        base_name = f"morphology_{cleaned_sample.patient_id}"
+        output_path = "test/" + test_name + "/" + f"{base_name}.html"
+        counter = 1
+        while os.path.exists(output_path):
+            output_path = f"{base_name}_{counter}.html"
+            counter += 1
+        fig.write_html(output_path)
+        print(f"Saved plot to: {output_path}")
+        if show:
+            fig.show()
 
     @staticmethod
-    def plot_morphology_from_apg(clean_sample: BPSample, ppg_wave: list):
+    def plot_morphology_from_apg(clean_sample: BPSample, ppg_wave: list, test_name, show=True):
         fs = clean_sample.target_fs
         time = np.array(clean_sample.ecg_timestamps)
         ppg_proc = clean_sample.ppg
@@ -345,27 +375,25 @@ class Visualizator:
             },
             height=1000, template="plotly_dark", showlegend=True,
                           xaxis3_rangeslider_visible=True)
-        fig.show()
+        # ── SAVE ──────────────────────────────────────────────────────────────────
+        base_name = f"morphology_{clean_sample.patient_id}"
+        output_path = "test/" + test_name + "/" + f"{base_name}.html"
+        counter = 1
+        while os.path.exists(output_path):
+            output_path = f"{base_name}_{counter}.html"
+            counter += 1
+        fig.write_html(output_path)
+        print(f"Saved plot to: {output_path}")
+        if show:
+            fig.show()
 
     @staticmethod
-    def plot_estimation_performance(sample, ppg_wave, time_feature):
+    def plot_estimation_performance(sample, calib, test_name, show=True):
         """
         Visualizes the pre-calculated Bayesian Estimation.
         No math performed here.
         """
-        fs = sample.target_fs
-
-        # 1. Extract Features & Get Calibration Results
-        df_feat = FeatureExporter.extract_training_data(samples=[sample],
-                                                        ppg_waves=[ppg_wave],
-                                                        time_features=[time_feature])
-        calib = SubjectCalibrator().calibrate_patient(df_feat, sample.patient_id)
-
-        if not calib:
-            print(f"Calibration failed for {sample.patient_id}")
-            return
-
-        # 2. Retrieve Pre-Calculated Stats (No Simulation Here)
+        # Retrieve Pre-Calculated Stats (No Simulation Here)
         mu_s = calib['sbp_est_mean']
         std_s = calib['sbp_est_std']
         mu_d = calib['dbp_est_mean']
@@ -403,16 +431,20 @@ class Visualizator:
         ), row=1, col=1)
 
         # Reference Lines
-        fig.add_vline(x=sample.bps, line_dash="dash", line_color="white", row=1, col=1,
-                      annotation_text="Ref SBP", annotation_position="top right")
-        fig.add_vline(x=sample.bpd, line_dash="dash", line_color="cyan", row=1, col=1,
-                      annotation_text="Ref DBP", annotation_position="top right")
+        if sample.bps is not None:
+            fig.add_vline(x=sample.bps, line_dash="dash", line_color="white", row=1, col=1,
+                          annotation_text="Ref SBP", annotation_position="top right")
+        if sample.bpd is not None:
+            fig.add_vline(x=sample.bpd, line_dash="dash", line_color="cyan", row=1, col=1,
+                          annotation_text="Ref DBP", annotation_position="top right")
 
         # --- COL 2: METRIC TABLE ---
         def fmt(val, err, unit=""):
             return f"{val:.4f} ± {err:.4f} {unit}"
 
         # We define 3 columns: Metric Name, Reference Value, Estimated Value
+        ref_sbp = f"{sample.bps:.2f} mmHg" if sample.bps is not None else "N/A"
+        ref_dbp = f"{sample.bpd:.2f} mmHg" if sample.bpd is not None else "N/A"
         fig.add_trace(go.Table(
             header=dict(values=['<b>Metric</b>', '<b>Reference</b>', '<b>Bayesian Est. (μ ± σ)</b>'],
                         fill_color='#4B0082', font=dict(color='white', size=12), align='left'),
@@ -423,7 +455,7 @@ class Visualizator:
                      'Stiffness (α)', 'Elasticity (E0)', 'Wall Ratio (h/d)', 'Intercept (β0)'],
 
                     # COL 2: REFERENCE (Ground Truth)
-                    [f"{sample.bps:.2f} mmHg", f"{sample.bpd:.2f} mmHg", "", "-", "-", "-", "-"],
+                    [ref_sbp, ref_dbp, "", "-", "-", "-", "-"],
 
                     # COL 3: ESTIMATED
                     [f"<b>{fmt(mu_s, std_s, 'mmHg')}</b>",
@@ -448,11 +480,20 @@ class Visualizator:
         )
 
         fig.update_xaxes(range=[20, 240], row=1, col=1)
-
-        fig.show()
+        # Save HTML without overwriting
+        base_name = f"plot_estimation_{sample.patient_id}"
+        output_path = "test/" + test_name + "/" + f"{base_name}.html"
+        counter = 1
+        while os.path.exists(output_path):
+            output_path = f"{base_name}_{counter}.html"
+            counter += 1
+        fig.write_html(output_path)
+        print(f"Saved plot to: {output_path}")
+        if show:
+            fig.show()
 
     @staticmethod
-    def plot_population_accuracy(df_results, kpis):
+    def plot_population_accuracy(df_results, kpis, test_name, show=True):
         """
         Plots the Clinical Validation Dashboard:
         - Row 1: Correlation Plots (Estimated vs Reference)
@@ -535,10 +576,19 @@ class Visualizator:
             title="Population Hemodynamic Accuracy Assessment (AAMI Standard)",
             template="plotly_dark", height=800, width=1200
         )
-        fig.show()
+        base_name = "accuracy_assessment"
+        output_path = "test/" + test_name + "/" + f"{base_name}.html"
+        counter = 1
+        while os.path.exists(output_path):
+            output_path = f"{base_name}_{counter}.html"
+            counter += 1
+        fig.write_html(output_path)
+        print(f"Saved plot to: {output_path}")
+        if show:
+            fig.show()
 
     @staticmethod
-    def plot_parameter_histograms(df_results):
+    def plot_parameter_histograms(df_results, test_name, show=True):
         """
         Visualizes the distribution of the HIDDEN parameters (Alpha, E0, h/d)
         to ensure they match physiological expectations.
@@ -561,7 +611,16 @@ class Visualizator:
             title="Biophysical Parameter Distribution (Population)",
             template="plotly_dark", height=400
         )
-        fig.show()
+        base_name = "Biophysical_Parameter_Distribution"
+        output_path = "test/" + test_name + "/" + f"{base_name}.html"
+        counter = 1
+        while os.path.exists(output_path):
+            output_path = f"{base_name}_{counter}.html"
+            counter += 1
+        fig.write_html(output_path)
+        print(f"Saved plot to: {output_path}")
+        if show:
+            fig.show()
 
     @staticmethod
     def plot_fiducial_comparison(sample, clean_sample, ppg_wave, colleague_csv_path, colleague_fs=25.0):

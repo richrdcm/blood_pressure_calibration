@@ -36,7 +36,7 @@ MCS_MAPPING = {
         "bps": "bps", "bpd": "bpd", "patient_id": "patient_id"
     },
     "channels": {
-        "ppg": {"fs": 20},   # <--- Change this if the watch updates
+        "ppg": {"fs": 64},   # <--- Change this if the watch updates
         "ecg": {"fs": 125}   # <--- Change this if the watch updates
     },
     "target_fs": 125,

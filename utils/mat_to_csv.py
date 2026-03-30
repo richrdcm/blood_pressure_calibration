@@ -103,4 +103,4 @@ def convert_uci_v73_mat_to_csv(mat_path, output_path):
         print(f"Could not open {mat_path}. Is it a valid .mat file?")
 
 # Usage
-convert_uci_v73_mat_to_csv('datasets/raw/uci/Part_1.mat', 'datasets/raw/uci/Part_1.csv')
+convert_uci_v73_mat_to_csv('datasets/raw/uci/Part_3.mat', 'datasets/raw/uci/Part_3.csv')
