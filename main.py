@@ -12,28 +12,32 @@ import os
 
 def main():
     loader = DataLoader()
-    #file_type = "mcs"
-    file_type = "uci"
+    file_type = "mcs"
+    #file_type = "uci"
     #file_path = "datasets/raw/mcs/fihmi-2026-03-03T09-30.csv"
     #file_path = "datasets/raw/mcs/2026_02_05_09_26_44.csv"
-    #file_path = "datasets/raw/mcs/ECG_Calib_64hz/fihmi/fihmi_calib_macAddress_6c1deb04a9ce_pt"
-    #bp_ref_path = "datasets/raw/mcs/ECG_Calib_64hz/fihmi/bp_ref.csv"
-    file_path = "datasets/raw/uci/Part_1.csv"
-    test_name = "uci_e_as_diastolic_peak"
+    file_path = "datasets/raw/mcs/ECG_Calib_64hz/fihmi/fihmi_calib_macAddress_6c1deb04a9ce_pt"
+    bp_ref_path = "datasets/raw/mcs/ECG_Calib_64hz/fihmi/bp_ref.csv"
+    #file_path = "datasets/raw/uci/Part"
+    #test_name = "uci_e_as_diastolic_peak"
+    test_name = "fihmi"
     os.makedirs("test/" + test_name, exist_ok=True)
 
 
     # 1. Load Data
     #samples = loader.load_from_csv(file_path, file_type, max_duration_msec=None)
-    #samples = loader.load_from_csv(file_path, file_type,
-    #                               index_from=370, index_to=370,  #528,
-    #                               each_file_is_own_patient=False,
-    #                               max_duration_msec=100000)
-
+    samples = loader.load_from_csv(file_path, file_type,
+                                   index_from=14, index_to=528,  #528,
+                                   each_file_is_own_patient=False,
+                                   bp_ref_path=bp_ref_path)
+    # UCI Dataset
+    """
     samples = loader.load_from_csv(
         file_path=file_path,
-        dataset_type=file_type
+        dataset_type=file_type,
+        index_from=1, index_to=4
     )
+    """
 
     if not samples:
         print("No samples loaded.")
@@ -74,7 +78,7 @@ def main():
     calibrations = SubjectCalibrator().calibrate_patients(df_feat)
 
     # 6. Evaluation
-    df_results = HemodynamicEvaluator.process_population(samples=samples,
+    df_results = HemodynamicEvaluator.process_population(samples=cleaned_samples,
                                                          ppg_waves=ppg_waves,
                                                          time_features=time_features,
                                                          calibrations=calibrations)

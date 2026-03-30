@@ -105,24 +105,28 @@ class DataLoader:
     def load_from_csv(
             file_path: str,
             dataset_type: str,
-            max_duration_msec: float = None,
             index_from: int = None,
             index_to: int = None,
             each_file_is_own_patient: bool = True,
-            bp_ref_path: str = None
+            bp_ref_path: str = None,
+            min_duration_msec: float = 60000,
+            max_duration_msec: float = None,
     ) -> list:
 
-        # ── Build file list ──
+        # ── Build file list ───────────────────────────────────────────────────
         if index_from is not None and index_to is not None:
-            paths = [f"{file_path}_{i}.csv" for i in range(index_from, index_to + 1) if
-                     os.path.isfile(f"{file_path}_{i}.csv")]
+            paths = [
+                f"{file_path}_{i}.csv"
+                for i in range(index_from, index_to + 1)
+                if os.path.isfile(f"{file_path}_{i}.csv")
+            ]
             if not paths:
                 print("[load_from_csv] No files found in the given range.")
                 return []
         else:
             paths = [file_path]
 
-        # ── Load BP reference ──
+        # ── Load BP reference (MCS only) ──────────────────────────────────────
         bp_ref_df = DataLoader._parse_bp_reference(bp_ref_path) if bp_ref_path else pd.DataFrame()
 
         config = DATASET_CONFIGS[dataset_type]
@@ -132,7 +136,7 @@ class DataLoader:
         unit_conv = config["unit_conversion"]["timestamp"]
         prefix_stem = os.path.splitext(os.path.basename(file_path))[0]
 
-        # ── Load and concatenate all files ──
+        # ── Load and concatenate all files ────────────────────────────────────
         frames = []
         for p in paths:
             df = pd.read_csv(p)
@@ -145,10 +149,12 @@ class DataLoader:
             elif not each_file_is_own_patient:
                 df[raw_pid_col] = prefix_stem
 
-            # Convert raw timestamp to absolute datetime
+            # Absolute datetime for BP alignment
             raw_ts_sec = df[raw_ts_col] / 1000.0 if dataset_type == "mcs" else df[raw_ts_col]
             df['abs_datetime'] = pd.to_datetime(raw_ts_sec, unit='s')
+            df['_source_file'] = file_stem  # track which file each row came from
 
+            # Time cap (only when no BP reference involved)
             if bp_ref_df.empty and max_duration_msec is not None:
                 start_time = df[raw_ts_col].min()
                 duration_in_raw_units = max_duration_msec * unit_conv
@@ -171,18 +177,45 @@ class DataLoader:
 
         samples = []
 
-        for file_idx, (pid, group) in enumerate(raw_df.groupby(raw_pid_col), start=1):
+        for pid, group in raw_df.groupby(raw_pid_col):
             group_sorted = group.sort_values('abs_datetime')
 
-            if not bp_ref_df.empty:
+            # ── UCI: BP embedded in columns, split on BP change points ──────
+            if dataset_type == "uci":
+                # For UCI, pid comes directly from the patient_id column in the CSV
+                # so it already correctly identifies the patient across multiple files.
+                # We prefix with the source file stem only when the pid is ambiguous
+                # (i.e. when the CSV had no patient_id column and we used the filename).
+                source_files = group_sorted['_source_file'].unique()
+                if len(source_files) > 1:
+                    # Patient spans multiple files — use pid as-is (already unique)
+                    effective_pid = str(pid)
+                else:
+                    # Single file — prefix with file stem to avoid collisions
+                    # e.g. pid=1 from Part_1.csv → "Part_1_patient_1"
+                    effective_pid = f"{source_files[0]}_{pid}"
+
+                samples += DataLoader._split_uci_by_bp(
+                    group=group_sorted,
+                    pid=effective_pid,
+                    raw_ppg_col=raw_ppg_col,
+                    raw_ecg_col=raw_ecg_col,
+                    raw_bps_col=raw_bps_col,
+                    raw_bpd_col=raw_bpd_col,
+                    config=config,
+                    max_duration_msec=max_duration_msec,
+                    min_duration_msec=min_duration_msec,
+                )
+
+            # ── MCS: BP from external reference file ──────────────────────
+            elif not bp_ref_df.empty:
                 window_ms = max_duration_msec if max_duration_msec else 60000
                 window_td = pd.Timedelta(milliseconds=window_ms)
 
-                # Filter to only the BPs that happened during/after the recording started
-                bp_in_window = bp_ref_df[bp_ref_df['datetime'] >= group_sorted['abs_datetime'].min()].reset_index(
-                    drop=True)
+                bp_in_window = bp_ref_df[
+                    bp_ref_df['datetime'] >= group_sorted['abs_datetime'].min()
+                    ].reset_index(drop=True)
 
-                # We use the recording start as the very first lower boundary
                 boundaries = [group_sorted['abs_datetime'].min()] + bp_in_window['datetime'].tolist()
 
                 for i, bp_row in bp_in_window.iterrows():
@@ -190,65 +223,187 @@ class DataLoader:
                     bps = float(bp_row['bps'])
                     bpd = float(bp_row['bpd'])
 
-                    # 1. Define the BROAD safe zone: Between the last BP reading (or start) and this BP reading
                     broad_start = boundaries[i]
                     broad_end = bp_dt
-
-                    mask = (group_sorted['abs_datetime'] >= broad_start) & (group_sorted['abs_datetime'] <= broad_end)
+                    mask = (group_sorted['abs_datetime'] >= broad_start) & \
+                           (group_sorted['abs_datetime'] <= broad_end)
                     broad_group = group_sorted[mask]
 
                     if len(broad_group) < 10:
-                        print(
-                            f"[BP Ref] Warning: File {file_idx} (Patient {pid}) lacks any signal data in the interval before {bp_dt}. Skipping.")
+                        print(f"[BP Ref] Patient {pid} interval {i}: insufficient data — skipping.")
                         continue
 
-                    # 2. Find the VERY LAST recorded data point in this broad zone
                     actual_last_dt = broad_group['abs_datetime'].max()
-
-                    # 3. Snap the 60-second window to exactly end at that last available point
                     target_start_dt = actual_last_dt - window_td
-
                     final_group = broad_group[broad_group['abs_datetime'] >= target_start_dt]
 
                     if len(final_group) < 10:
-                        print(
-                            f"[BP Ref] Warning: Patient {pid}_bp_reading_{i + 1} lacks sufficient signal data ending at {actual_last_dt}. Skipping.")
+                        print(f"[BP Ref] Patient {pid}_bp{i + 1}: insufficient data in window — skipping.")
                         continue
 
                     time_gap = (bp_dt - actual_last_dt).total_seconds()
-                    print(f"[load_from_csv] Patient {pid}_bp_reading_{i + 1} matched BP at {bp_dt}: SBP={bps}, DBP={bpd}.")
-
-                    if time_gap > 10:
-                        print(
-                            f"    -> NOTE: Data dropped out early! Extracted {window_ms / 1000}s ending {time_gap:.1f}s BEFORE the actual BP reading.")
-                    else:
-                        print(
-                            f"    -> Extracted fresh {window_ms / 1000}s ending directly at {actual_last_dt} ({time_gap:.1f}s gap). Rows={len(final_group)}")
+                    print(f"[load_from_csv] Patient {pid}_bp{i + 1}: SBP={bps}, DBP={bpd}, "
+                          f"gap={time_gap:.1f}s, rows={len(final_group)}")
 
                     DataLoader._append_sample(
-                        group=final_group,
-                        pid=f"{pid}_bp_reading_{i + 1}",
-                        bps=bps,
-                        bpd=bpd,
-                        samples=samples,
+                        group=final_group, pid=f"{pid}_bp{i + 1}",
+                        bps=bps, bpd=bpd, samples=samples,
                         dataset_type=dataset_type,
-                        raw_ppg_col=raw_ppg_col,
-                        raw_ecg_col=raw_ecg_col,
-                        config=config
+                        raw_ppg_col=raw_ppg_col, raw_ecg_col=raw_ecg_col,
+                        config=config,
                     )
 
+            # ── MCS: No BP reference — single sample ──────────────────────
             else:
-                # ── No BP reference — single sample ──
                 bps_series = group[raw_bps_col].dropna() if raw_bps_col in group.columns else pd.Series(dtype=float)
                 bpd_series = group[raw_bpd_col].dropna() if raw_bpd_col in group.columns else pd.Series(dtype=float)
                 bps = float(bps_series.iloc[0]) if not bps_series.empty else None
                 bpd = float(bpd_series.iloc[0]) if not bpd_series.empty else None
-
-                DataLoader._append_sample(group_sorted, str(pid), bps, bpd, samples, dataset_type, raw_ppg_col,
-                                          raw_ecg_col, config)
+                DataLoader._append_sample(
+                    group_sorted, str(pid), bps, bpd, samples,
+                    dataset_type, raw_ppg_col, raw_ecg_col, config,
+                )
 
         print(f"[load_from_csv] Successfully generated {len(samples)} sample(s).")
         return samples
+
+    @staticmethod
+    def _split_uci_by_bp(
+            group: pd.DataFrame,
+            pid: str,
+            raw_ppg_col: str,
+            raw_ecg_col: str,
+            raw_bps_col: str,
+            raw_bpd_col: str,
+            config: dict,
+            max_duration_msec: float = None,
+            min_duration_msec: float = 60000,  # ← minimum 60 seconds per segment
+    ) -> list:
+        """
+        Splits a UCI patient group into one BPSample per unique BP measurement.
+        Only segments with at least min_duration_msec of signal are kept.
+        """
+        samples = []
+        fs = config["target_fs"]
+        min_samples = int(min_duration_msec * fs / 1000)
+
+        # ── Check BP columns exist ────────────────────────────────────────────
+        has_bps = raw_bps_col in group.columns and group[raw_bps_col].notna().any()
+        has_bpd = raw_bpd_col in group.columns and group[raw_bpd_col].notna().any()
+
+        if not has_bps or not has_bpd:
+            print(f"[UCI] Patient {pid}: no BP columns — creating single sample.")
+            DataLoader._append_sample(
+                group, pid, None, None, samples,
+                "uci", raw_ppg_col, raw_ecg_col, config,
+            )
+            return samples
+
+        # ── Detect BP change points ───────────────────────────────────────────
+        bps_vals = group[raw_bps_col].ffill()
+        bpd_vals = group[raw_bpd_col].ffill()
+        bp_changed = (
+                (bps_vals != bps_vals.shift(1)) |
+                (bpd_vals != bpd_vals.shift(1))
+        )
+        bp_changed.iloc[0] = True
+        segment_ids = bp_changed.cumsum()
+        n_segments = segment_ids.nunique()
+
+        print(f"[UCI] Patient {pid}: {n_segments} BP segment(s) detected "
+              f"across {len(group)} rows.")
+
+        skipped_short = 0
+        skipped_no_bp = 0
+        skipped_trim = 0
+
+        for seg_id, seg_group in group.groupby(segment_ids):
+            seg_group = seg_group.copy().sort_values('standard_ts')
+
+            # ── BP value for this segment ─────────────────────────────────────
+            bps_series = seg_group[raw_bps_col].dropna()
+            bpd_series = seg_group[raw_bpd_col].dropna()
+
+            if bps_series.empty or bpd_series.empty:
+                skipped_no_bp += 1
+                continue
+
+            bps = float(bps_series.iloc[0])
+            bpd = float(bpd_series.iloc[0])
+
+            # ── Check raw segment duration BEFORE any trimming ────────────────
+            ts_min_raw = seg_group['standard_ts'].min()
+            ts_max_raw = seg_group['standard_ts'].max()
+            raw_duration_ms = ts_max_raw - ts_min_raw
+
+            if raw_duration_ms < min_duration_msec:
+                skipped_short += 1
+                print(f"[UCI] Patient {pid} segment {seg_id} (SBP={bps}, DBP={bpd}): "
+                      f"only {raw_duration_ms / 1000:.1f}s available "
+                      f"(need {min_duration_msec / 1000:.0f}s) — skipping.")
+                continue
+
+            # ── Apply ECG/PPG alignment ───────────────────────────────────────
+            ecg_arr = seg_group[raw_ecg_col].values if raw_ecg_col in seg_group.columns else None
+            ppg_arr = seg_group[raw_ppg_col].values
+
+            if ecg_arr is not None and len(ecg_arr) > 0:
+                aligned_ppg = PulseDBStyleAligner.align(
+                    ppg_arr, ecg_arr, config["target_fs"]
+                )
+                seg_group[raw_ppg_col] = aligned_ppg
+
+            # ── Trim to last N ms (closest to BP measurement moment) ──────────
+            # After trimming we re-check the duration guarantee
+            if max_duration_msec is not None:
+                ts_max = seg_group['standard_ts'].max()
+                ts_cutoff = ts_max - max_duration_msec
+                seg_group = seg_group[seg_group['standard_ts'] >= ts_cutoff]
+
+                # Re-check after trim
+                trimmed_duration_ms = (
+                        seg_group['standard_ts'].max() -
+                        seg_group['standard_ts'].min()
+                )
+                if trimmed_duration_ms < min_duration_msec:
+                    skipped_trim += 1
+                    print(f"[UCI] Patient {pid} segment {seg_id}: "
+                          f"only {trimmed_duration_ms / 1000:.1f}s after trim "
+                          f"(need {min_duration_msec / 1000:.0f}s) — skipping.")
+                    continue
+
+            # ── Final row count sanity check ──────────────────────────────────
+            # At target_fs, 60s = 60*fs rows minimum
+            if len(seg_group) < min_samples:
+                skipped_short += 1
+                print(f"[UCI] Patient {pid} segment {seg_id}: "
+                      f"{len(seg_group)} rows < {min_samples} required "
+                      f"({min_duration_msec / 1000:.0f}s × {fs}Hz) — skipping.")
+                continue
+
+            duration_s = (seg_group['standard_ts'].max() - seg_group['standard_ts'].min()) / 1000
+            print(f"[UCI] Patient {pid} segment {seg_id}: "
+                  f"SBP={bps}, DBP={bpd}, "
+                  f"duration={duration_s:.1f}s, rows={len(seg_group)} ✓")
+
+            DataLoader._append_sample(
+                group=seg_group,
+                pid=f"{pid}_seg{seg_id}",
+                bps=bps, bpd=bpd,
+                samples=samples,
+                dataset_type="uci",
+                raw_ppg_col=raw_ppg_col,
+                raw_ecg_col=raw_ecg_col,
+                config=config,
+            )
+
+        print(f"[UCI] Patient {pid}: {len(samples)} valid segment(s) produced. "
+              f"Skipped: {skipped_short} too short, "
+              f"{skipped_no_bp} no BP, "
+              f"{skipped_trim} insufficient after trim.")
+
+        return samples
+
 
 class PulseDBStyleAligner:
     @staticmethod
